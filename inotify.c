@@ -18,11 +18,22 @@
 
 #include <dirent.h>
 #include <errno.h>
-#include <linux/limits.h>
+#ifdef linux
+	#include <linux/limits.h>
+#else
+	#include <limits.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/inotify.h>
+#ifdef linux
+	#include <sys/inotify.h>
+#else
+	#include <sys/types.h>
+	#include <sys/event.h>
+	#include <sys/time.h>
+	#include <fcntl.h>
+#endif /* defined linux */
 #include <sys/stat.h>
 #include <syslog.h>
 #include <unistd.h>
@@ -46,12 +57,19 @@ static int watch_count = 0;
 static table* watches;
 static bool limit_reached = false;
 static void (* callback)(char*, int) = NULL;
-
+#ifdef linux
 #define EVENT_SIZE (sizeof(struct inotify_event))
+#else
+#define EVENT_SIZE (sizeof(struct kevent))
+#endif /* defined linux */
 #define EVENT_BUF_LEN (2048 * (EVENT_SIZE + 16))
+#ifdef linux
 static char event_buf[EVENT_BUF_LEN];
+#else
+static struct kevent event_buf[2048];
+#endif /* defined linux */
 
-
+#ifdef linux
 static void read_watch_descriptors_count() {
   FILE* f = fopen(WATCH_COUNT_NAME, "r");
   if (f == NULL) {
@@ -69,22 +87,28 @@ static void read_watch_descriptors_count() {
 
   fclose(f);
 }
+#endif
 
 
 bool init_inotify() {
+#ifdef linux
   inotify_fd = inotify_init();
+#else
+  inotify_fd = kqueue();
+#endif /* defined linux */
   if (inotify_fd < 0) {
     userlog(LOG_ERR, "inotify_init: %s", strerror(errno));
     return false;
   }
   userlog(LOG_DEBUG, "inotify fd: %d", get_inotify_fd());
-
+#ifdef linux
   read_watch_descriptors_count();
   if (watch_count <= 0) {
     close(inotify_fd);
     inotify_fd = -1;
     return false;
   }
+#endif
   userlog(LOG_INFO, "inotify watch descriptors: %d", watch_count);
 
   watches = table_create(watch_count);
@@ -120,6 +144,7 @@ inline bool watch_limit_reached() {
 
 
 static int add_watch(const char* path, watch_node* parent) {
+#ifdef linux
   int wd = inotify_add_watch(inotify_fd, path, IN_MODIFY | IN_ATTRIB | IN_CREATE | IN_DELETE | IN_MOVE | IN_DELETE_SELF);
   if (wd < 0) {
     if (errno == ENOSPC) {
@@ -128,6 +153,16 @@ static int add_watch(const char* path, watch_node* parent) {
     userlog(LOG_ERR, "inotify_add_watch(%s): %s", path, strerror(errno));
     return ERR_CONTINUE;
   }
+#else
+  struct kevent ev;
+  int wd = open(path, O_RDONLY);
+  EV_SET(&ev, wd, EVFILT_VNODE | EVFILT_READ, EV_ADD, 
+		  NOTE_DELETE | NOTE_WRITE | NOTE_EXTEND | NOTE_ATTRIB | NOTE_LINK | NOTE_RENAME | NOTE_REVOKE, 
+		  0, NULL);
+  if(kevent(inotify_fd,&ev,1,NULL,0,NULL)==-1) {
+	  perror("kevent");
+  }
+#endif /* defined linux */
   else {
     userlog(LOG_DEBUG, "watching %s: %d", path, wd);
   }
@@ -175,11 +210,19 @@ static void rm_watch(int wd, bool update_parent) {
   }
 
   userlog(LOG_DEBUG, "unwatching %s: %d (%p)", node->name, node->wd, node);
-
+#ifdef linux
   if (inotify_rm_watch(inotify_fd, node->wd) < 0) {
     userlog(LOG_DEBUG, "inotify_rm_watch(%d:%s): %s", node->wd, node->name, strerror(errno));
   }
-
+#else
+  struct kevent ev;
+  EV_SET(&ev, wd, EVFILT_VNODE | EVFILT_READ, EV_DELETE, 
+		  NOTE_DELETE | NOTE_WRITE | NOTE_EXTEND | NOTE_ATTRIB | NOTE_LINK | NOTE_RENAME | NOTE_REVOKE, 
+		  0, NULL);
+  if(kevent(inotify_fd,&ev,1,NULL,0,NULL)==-1) {
+	  perror("kevent");
+  }
+#endif
   for (int i=0; i<array_size(node->kids); i++) {
     watch_node* kid = array_get(node->kids, i);
     if (kid != NULL) {
@@ -294,33 +337,51 @@ void unwatch(int id) {
   rm_watch(id, true);
 }
 
-
+#ifdef linux
 static bool process_inotify_event(struct inotify_event* event) {
+#else
+static bool process_inotify_event(struct kevent* event) {
+#endif /* defined linux */
+#ifdef linux
   watch_node* node = table_get(watches, event->wd);
+#else
+  watch_node* node = table_get(watches, event->ident);
+#endif
   if (node == NULL) {
     return true;
   }
-
+#ifdef linux
   userlog(LOG_DEBUG, "inotify: wd=%d mask=%d dir=%d name=%s",
       event->wd, event->mask & (~IN_ISDIR), (event->mask & IN_ISDIR) != 0, node->name);
-
+#else
+  userlog(LOG_DEBUG, "inotify: ident=%d filter=%d fflags=%d name=%s",
+      event->ident, event->filter , event->fflags , node->name);
+#endif /*defined linux */
   char path[PATH_MAX];
   strcpy(path, node->name);
+#ifdef linux
   if (event->len > 0) {
     if (path[strlen(path) - 1] != '/') {
       strcat(path, "/");
     }
     strcat(path, event->name);
   }
-
+#endif
+#ifdef linux
   if ((event->mask & IN_CREATE || event->mask & IN_MOVED_TO) && event->mask & IN_ISDIR) {
+#else
+  if ((event->filter & EVFILT_VNODE) && ((event->fflags & NOTE_WRITE) || (event->fflags & NOTE_EXTEND) || (event->fflags & NOTE_LINK))) {
+#endif /* defined linux */
     int result = walk_tree(path, node, NULL);
     if (result < 0 && result != ERR_IGNORE) {
       return false;
     }
   }
-
+#ifdef linux
   if ((event->mask & IN_DELETE || event->mask & IN_MOVED_FROM) && event->mask & IN_ISDIR) {
+#else
+  if ((event->filter & EVFILT_VNODE) && ((event->fflags & NOTE_DELETE))) {
+#endif /* defined linux */
     for (int i=0; i<array_size(node->kids); i++) {
       watch_node* kid = array_get(node->kids, i);
       if (kid != NULL && strcmp(kid->name, path) == 0) {
@@ -332,14 +393,21 @@ static bool process_inotify_event(struct inotify_event* event) {
   }
 
   if (callback != NULL) {
+#ifdef linux
     (*callback)(path, event->mask);
+#else
+    (*callback)(path, event->fflags);
+#endif /* defined linux */
   }
   return true;
 }
 
-
 bool process_inotify_input() {
+#ifdef linux
   size_t len = read(inotify_fd, event_buf, EVENT_BUF_LEN);
+#else
+  size_t len = kevent(inotify_fd,NULL,0,event_buf,2048,NULL);
+#endif
   if (len < 0) {
     userlog(LOG_ERR, "read: %s", strerror(errno));
     return false;
@@ -347,6 +415,7 @@ bool process_inotify_input() {
 
   int i = 0;
   while (i < len) {
+#ifdef linux
     struct inotify_event* event = (struct inotify_event*) &event_buf[i];
     i += EVENT_SIZE + event->len;
 
@@ -357,7 +426,9 @@ bool process_inotify_input() {
       userlog(LOG_ERR, "event queue overflow");
       continue;
     }
-
+#else
+	struct kevent* event = &event_buf[i];
+#endif /* defined linux */
     if (!process_inotify_event(event)) {
       return false;
     }

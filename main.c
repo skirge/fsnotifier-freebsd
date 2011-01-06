@@ -21,7 +21,13 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/inotify.h>
+#ifdef linux
+	#include <sys/inotify.h>
+#else
+	#include <sys/types.h>
+	#include <sys/event.h>
+	#include <sys/time.h>
+#endif /* defined linux */
 #include <sys/select.h>
 #include <syslog.h>
 #include <unistd.h>
@@ -363,7 +369,7 @@ static bool unwatchable_mounts(array* mounts) {
   return true;
 }
 
-
+#ifdef linux
 static void inotify_callback(char* path, int event) {
   if (event & IN_CREATE || event & IN_MOVED_TO) {
     output("CREATE\n%s\n", path);
@@ -395,8 +401,17 @@ static void inotify_callback(char* path, int event) {
     return;
   }
 }
-
-
+#else 
+static void inotify_callback(char* path, int fflags) 
+{
+	switch(fflags) {
+	case NOTE_DELETE:
+		output("NOTE_DELETE\n%s\n",path);
+		userlog(LOG_DEBUG,"NOTE_DELETE: %s",path);
+		break;
+	}
+}
+#endif
 static void output(const char* format, ...) {
   if (self_test) {
     return;
