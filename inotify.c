@@ -32,7 +32,9 @@
 	#include <sys/types.h>
 	#include <sys/event.h>
 	#include <sys/time.h>
+	#include <sysexits.h>
 	#include <fcntl.h>
+	#include <err.h>
 #endif /* defined linux */
 #include <sys/stat.h>
 #include <syslog.h>
@@ -53,7 +55,7 @@ typedef struct __watch_node {
 } watch_node;
 
 static int inotify_fd = -1;
-static int watch_count = 0;
+static int watch_count = 1000000;
 static table* watches;
 static bool limit_reached = false;
 static void (* callback)(char*, int) = NULL;
@@ -154,13 +156,28 @@ static int add_watch(const char* path, watch_node* parent) {
     return ERR_CONTINUE;
   }
 #else
-  struct kevent ev;
+  struct kevent eventlist[2];
+  int nevents = 0;
   int wd = open(path, O_RDONLY);
-  EV_SET(&ev, wd, EVFILT_VNODE | EVFILT_READ, EV_ADD, 
-		  NOTE_DELETE | NOTE_WRITE | NOTE_EXTEND | NOTE_ATTRIB | NOTE_LINK | NOTE_RENAME | NOTE_REVOKE, 
+  if(wd < 0 ) {
+	  userlog(LOG_ERR, "add_watch, cannot open: %s, err:%s", path, strerror(errno));
+	  return ERR_CONTINUE;
+  }
+  EV_SET(&eventlist[0], wd, EVFILT_VNODE, EV_ADD | EV_ENABLE | EV_CLEAR,
+		  NOTE_DELETE | NOTE_WRITE | NOTE_RENAME
+		  /*| NOTE_EXTEND | NOTE_ATTRIB | 
+		  NOTE_LINK | NOTE_RENAME | NOTE_REVOKE*/, 
 		  0, NULL);
-  if(kevent(inotify_fd,&ev,1,NULL,0,NULL)==-1) {
-	  perror("kevent");
+  nevents++;
+/*
+  EV_SET(&eventlist[1], wd, EVFILT_READ, EV_ADD | EV_ENABLE | EV_CLEAR, 
+		  0, 0, NULL);
+	nevents++;
+*/
+  if(kevent(inotify_fd, eventlist, 
+			  nevents, NULL, 0, NULL) < 0) {
+	  userlog(LOG_ERR, "kevent add event failed for: %s, %s", path, strerror(errno));
+	  err(EX_IOERR, "kevent add event failed for: %s",path);
   }
 #endif /* defined linux */
   else {
@@ -215,12 +232,23 @@ static void rm_watch(int wd, bool update_parent) {
     userlog(LOG_DEBUG, "inotify_rm_watch(%d:%s): %s", node->wd, node->name, strerror(errno));
   }
 #else
-  struct kevent ev;
-  EV_SET(&ev, wd, EVFILT_VNODE | EVFILT_READ, EV_DELETE, 
-		  NOTE_DELETE | NOTE_WRITE | NOTE_EXTEND | NOTE_ATTRIB | NOTE_LINK | NOTE_RENAME | NOTE_REVOKE, 
+  struct kevent eventlist[2];
+  int nevents=0;
+  EV_SET(&eventlist[0], wd, EVFILT_VNODE, EV_DELETE, 
+		  NOTE_DELETE | NOTE_WRITE | NOTE_RENAME
+		  /*| NOTE_EXTEND | NOTE_ATTRIB | 
+		  NOTE_LINK | NOTE_RENAME | NOTE_REVOKE*/, 
 		  0, NULL);
-  if(kevent(inotify_fd,&ev,1,NULL,0,NULL)==-1) {
-	  perror("kevent");
+	nevents++;
+/*
+  EV_SET(&eventlist[1], wd, EVFILT_READ, EV_DELETE, 
+		  0, 0, NULL);
+	nevents++;
+*/
+  if(kevent(inotify_fd, eventlist, 
+			  nevents, NULL, 0, NULL) < 0) {
+	  userlog(LOG_ERR, "kevent remove watch: %s, error:%s", node->name, strerror(errno));
+	  err(EX_OSERR, "kevent remove watch: %s, error:%s", node->name, strerror(errno));
   }
 #endif
   for (int i=0; i<array_size(node->kids); i++) {
@@ -243,6 +271,9 @@ static void rm_watch(int wd, bool update_parent) {
   array_delete(node->kids);
   free(node);
   table_put(watches, wd, NULL);
+  if(close(wd) < 0) {
+		userlog(LOG_WARNING,"close: %s, %s", node->name, strerror(errno));
+  }
 }
 
 
@@ -258,17 +289,24 @@ static bool is_directory(struct dirent* entry, const char* path) {
 }
 
 static bool is_ignored(const char* path, array* ignores) {
+
+  if(strstr(path, "/.") != NULL) { /* hidden directory */
+	  return true;
+  }
+
   if (ignores != NULL) {
     int pl = strlen(path);
     for (int i=0; i<array_size(ignores); i++) {
       const char* ignore = array_get(ignores, i);
       int il = strlen(ignore);
-      if (pl >= il && strncmp(path, ignore, il) == 0) {
+      if ((pl >= il && strncmp(path, ignore, il) == 0) ||
+		(strncmp(path+(pl-il),ignore,il)==0)) {
         userlog(LOG_DEBUG, "path %s is under unwatchable %s - ignoring", path, ignore);
         return true;
       }
     }
   }
+
   return false;
 }
 
@@ -282,16 +320,20 @@ static int walk_tree(const char* path, watch_node* parent, array* ignores) {
     if (errno == EACCES) {
       return ERR_IGNORE;
     }
+/*
     else if (errno == ENOTDIR) {  // flat root
       return add_watch(path, parent);
     }
+*/
     userlog(LOG_ERR, "opendir(%s): %s", path, strerror(errno));
     return ERR_CONTINUE;
   }
 
   int id = add_watch(path, parent);
   if (id < 0) {
-    closedir(dir);
+    if(closedir(dir) < 0) {
+		userlog(LOG_WARNING,"closedir: %s, %s", dir, strerror(errno));
+	}
     return id;
   }
 
@@ -309,10 +351,15 @@ static int walk_tree(const char* path, watch_node* parent, array* ignores) {
     }
 
     strcpy(p, entry->d_name);
+#if 1
     if (!is_directory(entry, subdir)) {
       continue;
     }
-
+#else
+	if(!is_directory(entry, subdir)) {
+		add_watch(subdir, parent);
+	} else {
+#endif
     int subdir_id = walk_tree(subdir, table_get(watches, id), ignores);
     if (subdir_id < 0 && subdir_id != ERR_IGNORE) {
       rm_watch(id, true);
@@ -320,8 +367,13 @@ static int walk_tree(const char* path, watch_node* parent, array* ignores) {
       break;
     }
   }
+#if 0
+  }
+#endif
 
-  closedir(dir);
+  if(closedir(dir) < 0 ) {
+		userlog(LOG_WARNING,"closedir: %s, %s", dir, strerror(errno));
+  }
   return id;
 }
 
@@ -354,8 +406,8 @@ static bool process_inotify_event(struct kevent* event) {
   userlog(LOG_DEBUG, "inotify: wd=%d mask=%d dir=%d name=%s",
       event->wd, event->mask & (~IN_ISDIR), (event->mask & IN_ISDIR) != 0, node->name);
 #else
-  userlog(LOG_DEBUG, "inotify: ident=%d filter=%d fflags=%d name=%s",
-      event->ident, event->filter , event->fflags , node->name);
+  userlog(LOG_DEBUG, "inotify: ident=%d filter=%d flags=%d fflags=%d data=%d udata=%d name=%s",
+      event->ident, event->filter , event->flags, event->fflags, event->data, event->udata , node->name);
 #endif /*defined linux */
   char path[PATH_MAX];
   strcpy(path, node->name);
@@ -370,18 +422,26 @@ static bool process_inotify_event(struct kevent* event) {
 #ifdef linux
   if ((event->mask & IN_CREATE || event->mask & IN_MOVED_TO) && event->mask & IN_ISDIR) {
 #else
-  if ((event->filter & EVFILT_VNODE) && ((event->fflags & NOTE_WRITE) || (event->fflags & NOTE_EXTEND) || (event->fflags & NOTE_LINK))) {
+  if ((event->filter == EVFILT_VNODE) && 
+		  ((event->fflags & NOTE_WRITE) || (event->fflags & NOTE_EXTEND) || 
+		   (event->fflags & NOTE_LINK))) {
 #endif /* defined linux */
+	userlog(LOG_DEBUG, "write detected in path:%s, fd:%d", path, event->ident);
+#ifdef linux /* do not process directories on write event under FreeBSD */
     int result = walk_tree(path, node, NULL);
     if (result < 0 && result != ERR_IGNORE) {
       return false;
     }
+#endif
   }
 #ifdef linux
   if ((event->mask & IN_DELETE || event->mask & IN_MOVED_FROM) && event->mask & IN_ISDIR) {
 #else
-  if ((event->filter & EVFILT_VNODE) && ((event->fflags & NOTE_DELETE))) {
+  if ((event->filter == EVFILT_VNODE) && 
+		  ((event->fflags & NOTE_DELETE) || (event->fflags & NOTE_REVOKE))
+		  || (event->fflags & NOTE_RENAME)) {
 #endif /* defined linux */
+	userlog(LOG_DEBUG, "remove, revoke or rename in path:%s, fd:%d", path, event->ident);
     for (int i=0; i<array_size(node->kids); i++) {
       watch_node* kid = array_get(node->kids, i);
       if (kid != NULL && strcmp(kid->name, path) == 0) {
@@ -428,6 +488,7 @@ bool process_inotify_input() {
     }
 #else
 	struct kevent* event = &event_buf[i];
+	i++;
 #endif /* defined linux */
     if (!process_inotify_event(event)) {
       return false;

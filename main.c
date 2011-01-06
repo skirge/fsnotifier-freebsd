@@ -24,6 +24,9 @@
 #ifdef linux
 	#include <sys/inotify.h>
 #else
+	#include <sys/param.h>
+	#include <sys/ucred.h>
+	#include <sys/mount.h>
 	#include <sys/types.h>
 	#include <sys/event.h>
 	#include <sys/time.h>
@@ -330,15 +333,33 @@ static bool register_roots(array* new_roots, array* unwatchable) {
   return true;
 }
 
+#ifdef linux
 static bool is_watchable(const char* dev, const char* mnt, const char* fs) {
+#else
+static bool is_watchable(const char* dev, const char* mnt, const char* fs, int local) {
+#endif
+#ifdef DEBUG
+#ifdef linux
+	userlog(LOG_DEBUG,"is_watchable: dev=%s, mnt=%s, fs=%s",
+			dev, mnt, fs);
+#else
+	userlog(LOG_DEBUG,"is_watchable: dev=%s, mnt=%s, fs=%s, local=%d",
+			dev, mnt, fs, local);
+#endif
+#endif
+#ifndef linux
+	if(local == 0) 
+		return false;
+#endif
   // don't watch special and network filesystems
-  return !(strncmp(mnt, "/dev", 4) == 0 || strncmp(mnt, "/proc", 5) == 0 || strncmp(mnt, "/sys", 4) == 0 ||
+  return !(strncmp(mnt,"/tmp",4) == 0 || strncmp(mnt, "/dev", 4) == 0 || strncmp(mnt, "/proc", 5) == 0 || strncmp(mnt, "/sys", 4) == 0 ||
            strcmp(fs, "fuse.gvfs-fuse-daemon") == 0 || strcmp(fs, "cifs") == 0 || strcmp(fs, "nfs") == 0);
 }
 
 #define MTAB_DELIMS " \t"
 
 static bool unwatchable_mounts(array* mounts) {
+#ifdef linux
   FILE* mtab = fopen("/etc/mtab", "r");
   if (mtab == NULL) {
     mtab = fopen("/proc/mounts", "r");
@@ -359,13 +380,28 @@ static bool unwatchable_mounts(array* mounts) {
       userlog(LOG_ERR, "can't parse mount line");
       return false;
     }
-
+#else
+	struct statfs* mnt_points;
+	int len;
+	if((len = getmntinfo(&mnt_points,MNT_NOWAIT))==-1) {
+		perror("getmntinfo");
+	}
+	for(int i=0;i<len;++i) {
+		char* dev = mnt_points[i].f_mntfromname;
+		char* point = mnt_points[i].f_mntonname;
+		char* fs = mnt_points[i].f_fstypename;
+		int local = (mnt_points[i].f_flags & MNT_LOCAL) != 0;
+    if (!is_watchable(dev, point, fs, local)) {
+#endif /* defined linux */
+#ifdef linux
     if (!is_watchable(dev, point, fs)) {
+#endif
       CHECK_NULL(array_push(mounts, strdup(point)));
     }
   }
-
+#ifdef linux
   fclose(mtab);
+#endif
   return true;
 }
 
@@ -404,18 +440,38 @@ static void inotify_callback(char* path, int event) {
 #else 
 static void inotify_callback(char* path, int fflags) 
 {
-	switch(fflags) {
-	case NOTE_DELETE:
-		output("NOTE_DELETE\n%s\n",path);
-		userlog(LOG_DEBUG,"NOTE_DELETE: %s",path);
-		break;
+	if((fflags & NOTE_EXTEND)) {
+		output("CREATE\n%s\n",path);
+    	userlog(LOG_DEBUG, "CREATE:%s",path);
+	}
+
+	if((fflags & NOTE_WRITE)) {
+		output("CHANGE\n%s\n",path);
+    	userlog(LOG_DEBUG, "CHANGE:%s",path);
+	}
+	
+	if(fflags & NOTE_ATTRIB) {
+		output("STATS\n%s\n",path);
+    	userlog(LOG_DEBUG, "STATS:%s",path);
+	}
+
+	if((fflags & NOTE_DELETE) || (fflags & NOTE_RENAME)) {
+		output("DELETE\n%s\n",path);
+    	userlog(LOG_DEBUG, "DELETE:%s",path);
+	}
+
+	if((fflags & NOTE_REVOKE)) {
+		output("RESET\n%s\n",path);
+    	userlog(LOG_DEBUG, "RESET:%s",path);
 	}
 }
 #endif
 static void output(const char* format, ...) {
+#ifdef DEBUG
   if (self_test) {
     return;
   }
+#endif /* defined DEBUG */
 
   va_list ap;
   va_start(ap, format);
