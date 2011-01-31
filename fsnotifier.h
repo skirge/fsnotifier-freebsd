@@ -21,12 +21,20 @@
 #include <stdio.h>
 
 
+// variable-length array
+typedef struct __array array;
+
+typedef struct __watch_node {
+  char* name;
+  int wd;
+  int isdir;
+  struct __watch_node* parent;
+  array* kids;
+} watch_node;
 // logging
 void userlog(int priority, const char* format, ...);
 
 
-// variable-length array
-typedef struct __array array;
 
 array* array_create(int initial_capacity);
 int array_size(array* a);
@@ -59,7 +67,7 @@ void set_inotify_callback(void (* callback)(char*, int));
 int get_inotify_fd();
 int get_watch_count();
 bool watch_limit_reached();
-int watch(const char* root, array* ignores);
+int watch(const char* root, watch_node* parent, array* ignores);
 void unwatch(int id);
 bool process_inotify_input();
 void close_inotify();
@@ -68,5 +76,10 @@ void close_inotify();
 // reads one line from stream, trims trailing carriage return if any
 // returns pointer to the internal buffer (will be overwriten on next call)
 char* read_line(FILE* stream);
+
+extern int level;
+extern array* UNWATCHABLE;
+extern array* ROOTS;
+void output(const char* format, ...);
 
 #endif
